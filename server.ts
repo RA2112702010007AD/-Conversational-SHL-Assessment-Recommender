@@ -34,8 +34,165 @@ function getAiClient(): GoogleGenAI {
   return aiClient;
 }
 
+// 1. Rate Limiting Middleware
+interface RateLimitRecord {
+  count: number;
+  resetTime: number;
+}
+
+const rateLimitStore = new Map<string, RateLimitRecord>();
+
+// Clean up store every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of rateLimitStore.entries()) {
+    if (now > record.resetTime) {
+      rateLimitStore.delete(key);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+function rateLimiter(options: { max: number; windowMs: number; isChat?: boolean }) {
+  return (req: any, res: any, next: any) => {
+    const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || req.ip;
+    const ipKey = `ip_${ip}`;
+    const now = Date.now();
+
+    // 1. IP-Based check
+    let ipRecord = rateLimitStore.get(ipKey);
+    if (!ipRecord || now > ipRecord.resetTime) {
+      ipRecord = { count: 0, resetTime: now + options.windowMs };
+    }
+    ipRecord.count++;
+    rateLimitStore.set(ipKey, ipRecord);
+
+    if (ipRecord.count > options.max) {
+      const retryAfter = Math.ceil((ipRecord.resetTime - now) / 1000);
+      res.setHeader("Retry-After", retryAfter);
+      return res.status(429).json({
+        reply: `Too many requests from this IP. Please wait ${retryAfter} seconds before trying again.`,
+        recommendations: [],
+        end_of_conversation: false
+      });
+    }
+
+    // 2. User-Based check (only if user is provided in body)
+    if (options.isChat && req.body && typeof req.body.user === "string" && req.body.user.trim()) {
+      const user = req.body.user.trim();
+      const userKey = `user_${user}`;
+      let userRecord = rateLimitStore.get(userKey);
+      if (!userRecord || now > userRecord.resetTime) {
+        userRecord = { count: 0, resetTime: now + options.windowMs };
+      }
+      userRecord.count++;
+      rateLimitStore.set(userKey, userRecord);
+
+      if (userRecord.count > options.max) {
+        const retryAfter = Math.ceil((userRecord.resetTime - now) / 1000);
+        res.setHeader("Retry-After", retryAfter);
+        return res.status(429).json({
+          reply: `Too many requests from user "${user}". Please wait ${retryAfter} seconds before trying again.`,
+          recommendations: [],
+          end_of_conversation: false
+        });
+      }
+    }
+
+    next();
+  };
+}
+
+// 2. Validation and Sanitization Middleware
+function sanitizeString(str: string): string {
+  return str.replace(/<[^>]*>/g, "");
+}
+
+function validateChatRequest(req: any, res: any, next: any) {
+  const body = req.body;
+
+  if (!body || typeof body !== "object") {
+    return res.status(400).json({ error: "Invalid request body." });
+  }
+
+  // Check for unexpected fields (whitelist: messages, engineMode, user)
+  const allowedFields = new Set(["messages", "engineMode", "user"]);
+  const bodyFields = Object.keys(body);
+  for (const field of bodyFields) {
+    if (!allowedFields.has(field)) {
+      return res.status(400).json({ error: `Unexpected field "${field}" in request body.` });
+    }
+  }
+
+  // Validate user (if present)
+  if ("user" in body) {
+    if (typeof body.user !== "string") {
+      return res.status(400).json({ error: 'Field "user" must be a string.' });
+    }
+    if (body.user.length > 100) {
+      return res.status(400).json({ error: 'Field "user" must not exceed 100 characters.' });
+    }
+    body.user = sanitizeString(body.user);
+  }
+
+  // Validate engineMode (if present)
+  if ("engineMode" in body) {
+    if (body.engineMode !== "hybrid" && body.engineMode !== "local") {
+      return res.status(400).json({ error: 'Field "engineMode" must be either "hybrid" or "local".' });
+    }
+  }
+
+  // Validate messages array
+  if (!body.messages || !Array.isArray(body.messages)) {
+    return res.status(400).json({ error: 'Field "messages" is required and must be an array.' });
+  }
+
+  if (body.messages.length === 0) {
+    return res.status(400).json({ error: 'Field "messages" must contain at least one message.' });
+  }
+
+  if (body.messages.length > 20) {
+    return res.status(400).json({ error: 'Field "messages" cannot exceed 20 messages.' });
+  }
+
+  // Validate each message
+  for (let i = 0; i < body.messages.length; i++) {
+    const msg = body.messages[i];
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+      return res.status(400).json({ error: `Message at index ${i} must be an object.` });
+    }
+
+    const allowedMsgFields = new Set(["role", "content"]);
+    const msgFields = Object.keys(msg);
+    for (const field of msgFields) {
+      if (!allowedMsgFields.has(field)) {
+        return res.status(400).json({ error: `Unexpected field "${field}" in message at index ${i}.` });
+      }
+    }
+
+    if (msg.role !== "user" && msg.role !== "assistant") {
+      return res.status(400).json({ error: `Message at index ${i} has invalid role "${msg.role}". Must be "user" or "assistant".` });
+    }
+
+    if (typeof msg.content !== "string") {
+      return res.status(400).json({ error: `Message at index ${i} has non-string content.` });
+    }
+
+    if (msg.content.length === 0) {
+      return res.status(400).json({ error: `Message at index ${i} cannot have empty content.` });
+    }
+
+    if (msg.content.length > 1000) {
+      return res.status(400).json({ error: `Message at index ${i} exceeds maximum length of 1000 characters.` });
+    }
+
+    msg.content = sanitizeString(msg.content);
+  }
+
+  next();
+}
+
 // 1. Health check endpoint - GET /health
-app.get("/health", (req, res) => {
+app.get("/health", rateLimiter({ max: 60, windowMs: 60000 }), (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
@@ -510,10 +667,10 @@ function runLocalFallback(messages: any[]): any {
 }
 
 // 2. Chat endpoint - POST /chat
-app.post("/chat", async (req, res) => {
+app.post("/chat", rateLimiter({ max: 100, windowMs: 60000, isChat: true }), validateChatRequest, async (req, res) => {
   const startTime = Date.now();
   try {
-    const { messages, engineMode } = req.body;
+    const { messages, engineMode, user } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ error: "Missing or invalid 'messages' array in request body." });
@@ -526,6 +683,8 @@ app.post("/chat", async (req, res) => {
     if (chatCache.has(cacheKey)) {
       console.log("[CACHE HIT] Serving response from server-side cache.");
       const cachedResponse = chatCache.get(cacheKey);
+      const duration = Date.now() - startTime;
+      res.setHeader("X-Latency-Ms", duration.toString());
       return res.status(200).json(cachedResponse);
     }
 
@@ -538,10 +697,15 @@ app.post("/chat", async (req, res) => {
       if (QUICK_SCENARIOS_MAP[normalizedLatest]) {
         console.log("[FAST PATH HIT] Intercepted Quick Scenario prompt. Serving instantly.");
         const result = QUICK_SCENARIOS_MAP[normalizedLatest];
+        const cleanResult = {
+          reply: result.reply,
+          recommendations: result.recommendations,
+          end_of_conversation: result.end_of_conversation
+        };
         const duration = Date.now() - startTime;
-        const responseData = { ...result, latencyMs: duration };
-        chatCache.set(cacheKey, responseData);
-        return res.status(200).json(responseData);
+        res.setHeader("X-Latency-Ms", duration.toString());
+        chatCache.set(cacheKey, cleanResult);
+        return res.status(200).json(cleanResult);
       }
     }
 
@@ -549,10 +713,15 @@ app.post("/chat", async (req, res) => {
     if (activeEngine === "local" || !process.env.GEMINI_API_KEY) {
       console.log("[LOCAL ENGINE] Processing query locally...");
       const localResult = runLocalFallback(messages);
+      const cleanResult = {
+        reply: localResult.reply,
+        recommendations: localResult.recommendations,
+        end_of_conversation: localResult.end_of_conversation
+      };
       const duration = Date.now() - startTime;
-      const responseData = { ...localResult, latencyMs: duration };
-      chatCache.set(cacheKey, responseData);
-      return res.status(200).json(responseData);
+      res.setHeader("X-Latency-Ms", duration.toString());
+      chatCache.set(cacheKey, cleanResult);
+      return res.status(200).json(cleanResult);
     }
 
     // 4. LLM API Call (Hybrid mode)
@@ -617,29 +786,38 @@ app.post("/chat", async (req, res) => {
     }
 
     const parsedResponse = JSON.parse(textOutput.trim());
+    const cleanResult = {
+      reply: parsedResponse.reply,
+      recommendations: parsedResponse.recommendations,
+      end_of_conversation: parsedResponse.end_of_conversation
+    };
     const duration = Date.now() - startTime;
-    const responseData = { ...parsedResponse, latencyMs: duration };
-    chatCache.set(cacheKey, responseData);
-    return res.status(200).json(responseData);
+    res.setHeader("X-Latency-Ms", duration.toString());
+    chatCache.set(cacheKey, cleanResult);
+    return res.status(200).json(cleanResult);
 
   } catch (error: any) {
     console.error("[API ERROR] Falling back to Local Recommendations Engine due to error:", error.message || error);
     try {
       const localResult = runLocalFallback(req.body.messages || []);
+      const cleanResult = {
+        reply: localResult.reply,
+        recommendations: localResult.recommendations,
+        end_of_conversation: localResult.end_of_conversation
+      };
       const duration = Date.now() - startTime;
-      const responseData = { ...localResult, latencyMs: duration };
+      res.setHeader("X-Latency-Ms", duration.toString());
       const activeEngine = req.body.engineMode || "auto";
       const cacheKey = JSON.stringify(req.body.messages) + `_mode_${activeEngine}`;
-      chatCache.set(cacheKey, responseData);
-      return res.status(200).json(responseData);
+      chatCache.set(cacheKey, cleanResult);
+      return res.status(200).json(cleanResult);
     } catch (fallbackError: any) {
       console.error("[FALLBACK ERROR] Local fallback failed too:", fallbackError);
+      res.setHeader("X-Latency-Ms", (Date.now() - startTime).toString());
       return res.status(500).json({
         reply: "I apologize, but I encountered an internal error processing your request. Please try again.",
         recommendations: [],
-        end_of_conversation: false,
-        latencyMs: Date.now() - startTime,
-        error: error.message || "Internal Server Error",
+        end_of_conversation: false
       });
     }
   }

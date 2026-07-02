@@ -254,7 +254,8 @@ export default function App() {
           role: m.role,
           content: m.content
         })),
-        engineMode: engineMode
+        engineMode: engineMode,
+        user: user || ""
       };
 
       const response = await fetch("/chat", {
@@ -263,7 +264,27 @@ export default function App() {
         body: JSON.stringify(requestPayload)
       });
 
+      // Extract latency from header
+      const latencyHeader = response.headers.get("X-Latency-Ms");
+      const latencyMs = latencyHeader ? parseInt(latencyHeader, 10) : undefined;
+
       if (!response.ok) {
+        if (response.status === 429) {
+          try {
+            const data = await response.json();
+            const botMessage: Message = {
+              role: "assistant",
+              content: data.reply || "Too many requests. Please wait a bit before trying again.",
+              recommendations: [],
+              end_of_conversation: false,
+              latencyMs: latencyMs
+            };
+            setMessages((prev) => [...prev, botMessage]);
+            return;
+          } catch (e) {
+            // fallback
+          }
+        }
         throw new Error(`Server returned status ${response.status}`);
       }
 
@@ -274,7 +295,7 @@ export default function App() {
         content: data.reply || "I've processed your input.",
         recommendations: data.recommendations || [],
         end_of_conversation: !!data.end_of_conversation,
-        latencyMs: data.latencyMs
+        latencyMs: latencyMs
       };
 
       setMessages((prev) => [...prev, botMessage]);
