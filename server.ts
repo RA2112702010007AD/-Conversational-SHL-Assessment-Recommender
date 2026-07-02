@@ -844,4 +844,13 @@ async function setupViteAndAssets() {
   });
 }
 
-setupViteAndAssets();
+const isMainFile = process.argv[1] && (
+  process.argv[1].includes("server.ts") ||
+  process.argv[1].includes("server.js")
+);
+
+if (isMainFile) {
+  setupViteAndAssets();
+}
+
+export { runLocalFallback, checkOutOfScope, normalizeText };
