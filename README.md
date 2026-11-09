@@ -34,7 +34,7 @@ An interactive, AI-powered assistant designed to guide recruiters and hiring man
   - Response JSON schemas on successful `/chat` requests conform strictly to grading expectations: `{ reply, recommendations, end_of_conversation }`.
   - Debugging and execution latency metadata is isolated entirely to custom `X-Latency-Ms` HTTP headers, protecting the JSON payload schema.
 * **Secure API Key Handling**:
-  - Key management is locked server-side using environment variables (`process.env.GEMINI_API_KEY`) and is never printed in logs or exposed to client scripts.
+  - Gemini credentials stay on the server. On Netlify, AI Gateway supplies them automatically to the recommendation function; no browser-side key or AI Studio configuration is required.
 
 ---
 
@@ -103,3 +103,9 @@ The conversation processor endpoint.
    ```bash
    npm run lint
    ```
+
+## Netlify hosting
+
+The modern Netlify Function serves `/chat` and `/health`, using the same validation, catalog, and local fallback as the standalone server. Hybrid mode calls Gemini through Netlify AI Gateway automatically. Local mode remains available, and provider failures fall back to catalog matching.
+
+Use `netlify dev --port 8889` to run the frontend and function together locally. The standalone `npm run dev` server can also use a locally configured Gemini credential.
