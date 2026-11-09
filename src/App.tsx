@@ -324,7 +324,7 @@ export default function App() {
         ...prev,
         {
           role: "assistant",
-          content: "Sorry, I am having trouble connecting to my recommendation engine. Please ensure your GEMINI_API_KEY is configured in the AI Studio panel."
+          content: "Sorry, I am having trouble connecting to my recommendation engine. Please try again in a moment."
         }
       ]);
     } finally {
